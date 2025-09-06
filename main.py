@@ -17,10 +17,306 @@ import uuid
 import time
 import sys
 import ctypes
+import base64
+import re
+from pathlib import Path
+
+try:
+    import pydivert
+    import socket
+    HAS_PYDIVERT = True
+except ImportError:
+    HAS_PYDIVERT = False
+    print("Warning: PyDivert not installed. Subplace joining will not work.")
+
+if sys.platform == "win32":
+    try:
+        import win32crypt
+        HAS_WIN32CRYPT = True
+    except ImportError:
+        HAS_WIN32CRYPT = False
+else:
+    HAS_WIN32CRYPT = False
 
 COOKIE_FILE = "roblox_cookie.txt"
-ctk.set_appearance_mode("light")
-ctk.set_default_color_theme("blue")
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("dark-blue")
+
+class GameJoinBlocker:
+    def __init__(self, parent_app):
+        self.parent_app = parent_app
+        self.blocked_ips = set()
+        self.blocked_count = 0
+        self.connections = {}
+        self.firewall_blocked = set()
+        self.running = False
+        self.blocker_thread = None
+        self.resolver_thread = None
+        self.first_firewall_block = False
+        self.auto_stop_timer = None
+        self.firewall_unblock_complete = threading.Event()
+        
+    def resolve_gamejoin_ips_continuous(self):
+        domains = [
+            "gamejoin.roblox.com",
+            "gamejoin.na.roblox.com",
+            "gamejoin.eu.roblox.com"
+        ]
+        
+        while self.running:
+            for domain in domains:
+                try:
+                    ips = socket.gethostbyname_ex(domain)[2]
+                    for ip in ips:
+                        if ip not in self.blocked_ips:
+                            self.blocked_ips.add(ip)
+                            self.parent_app.debug_log(f"📍 Added IP for blocking: {ip} ({domain})", "BLOCKER")
+                except:
+                    pass
+            time.sleep(10)
+    
+    def force_disconnect_roblox(self):
+        self.parent_app.debug_log("🔌 FORCING disconnect of ALL Roblox connections...", "BLOCKER")
+        
+        result = subprocess.run('wmic process where "name=\'RobloxPlayerBeta.exe\'" get ProcessId', 
+                              shell=True, capture_output=True, text=True)
+        
+        roblox_pids = []
+        for line in result.stdout.split('\n'):
+            line = line.strip()
+            if line.isdigit():
+                roblox_pids.append(line)
+        
+        if not roblox_pids:
+            self.parent_app.debug_log("   No Roblox processes found", "BLOCKER")
+            return
+            
+        self.parent_app.debug_log(f"   Found Roblox processes: {roblox_pids}", "BLOCKER")
+        
+        for pid in roblox_pids:
+            exe_result = subprocess.run(f'wmic process where ProcessId={pid} get ExecutablePath', 
+                                      shell=True, capture_output=True, text=True)
+            exe_path = None
+            for line in exe_result.stdout.split('\n'):
+                line = line.strip()
+                if line and 'RobloxPlayerBeta.exe' in line:
+                    exe_path = line
+                    break
+            
+            if exe_path:
+                rule_name = f"FORCE_DISCONNECT_ROBLOX_{pid}"
+                
+                cmd_add = f'netsh advfirewall firewall add rule name="{rule_name}" dir=out action=block program="{exe_path}" enable=yes'
+                subprocess.run(cmd_add, shell=True, capture_output=True)
+                self.parent_app.debug_log(f"   🔴 Blocked ALL outgoing connections for PID {pid}", "BLOCKER")
+                
+                time.sleep(0.5)
+                
+                cmd_del = f'netsh advfirewall firewall delete rule name="{rule_name}"'
+                subprocess.run(cmd_del, shell=True, capture_output=True)
+                self.parent_app.debug_log(f"   🟢 Unblocked connections for PID {pid}", "BLOCKER")
+        
+        self.parent_app.debug_log("   Resetting TCP connections...", "BLOCKER")
+        subprocess.run('netsh int tcp reset', shell=True, capture_output=True)
+        
+        time.sleep(0.5)
+        self.parent_app.debug_log("   ✅ All Roblox connections forcefully disconnected", "BLOCKER")
+    
+    def is_roblox_running(self):
+        try:
+            result = subprocess.run('tasklist', shell=True, capture_output=True, text=True)
+            return "RobloxPlayerBeta.exe" in result.stdout
+        except Exception as e:
+            self.parent_app.debug_log(f"Error checking if Roblox is running: {e}", "ERROR")
+            return False
+    
+    def temporary_firewall_block(self, ip_address):
+        if ip_address not in self.firewall_blocked:
+            self.firewall_blocked.add(ip_address)
+            self.firewall_unblock_complete.clear()
+            
+            rule_name = f"TEMP_GAMEJOIN_{ip_address}"
+            cmd = f'netsh advfirewall firewall add rule name="{rule_name}" dir=out action=block remoteip={ip_address}'
+            subprocess.run(cmd, shell=True, capture_output=True)
+            self.parent_app.debug_log(f"🔥 Firewall: temporarily blocked {ip_address}", "BLOCKER")
+            
+            if not self.first_firewall_block:
+                self.first_firewall_block = True
+                self.parent_app.debug_log("📌 First Firewall block - stopping blocker", "BLOCKER")
+                
+                self.running = False
+                self.parent_app.after(0, lambda: self.parent_app.update_status("✅ Blocker stopped after gamejoin block"))
+            
+            def unblock():
+                subprocess.run(f'netsh advfirewall firewall delete rule name="{rule_name}"', 
+                            shell=True, capture_output=True)
+                self.firewall_blocked.discard(ip_address)
+                self.parent_app.debug_log(f"✅ Firewall: unblocked {ip_address}", "BLOCKER")
+                self.firewall_unblock_complete.set()
+            
+            threading.Timer(2.5, unblock).start()
+    
+    def start_blocking(self):
+        if not HAS_PYDIVERT:
+            self.parent_app.debug_log("PyDivert not available", "ERROR")
+            return False
+        
+        self.parent_app.debug_log("🔄 Resetting blocker state...", "BLOCKER")
+        
+        if self.running:
+            self.parent_app.debug_log("⚠️ Previous blocker still running, stopping...", "BLOCKER")
+            self.stop_blocking()
+            time.sleep(1)
+        
+        self.blocked_count = 0
+        self.connections = {}
+        self.firewall_blocked = set()
+        self.first_firewall_block = False
+        self.firewall_unblock_complete.set()
+        
+        if self.auto_stop_timer and hasattr(self.auto_stop_timer, 'cancel'):
+            try:
+                self.auto_stop_timer.cancel()
+            except:
+                pass
+        self.auto_stop_timer = None
+        
+        self.parent_app.debug_log(f"Saved IPs for blocking: {self.blocked_ips}", "BLOCKER")
+        
+        self.parent_app.debug_log("🧹 Cleaning old firewall rules...", "BLOCKER")
+        subprocess.run('netsh advfirewall firewall delete rule name="TEMP_GAMEJOIN_*"', 
+                      shell=True, capture_output=True)
+        subprocess.run('netsh advfirewall firewall delete rule name="FORCE_DISCONNECT_*"', 
+                      shell=True, capture_output=True)
+        
+        self.force_disconnect_roblox()
+        
+        self.running = True
+        self.blocker_thread = threading.Thread(target=self._blocking_worker, daemon=True)
+        self.blocker_thread.start()
+        
+        time.sleep(0.5)
+        
+        self.parent_app.debug_log("✅ Blocker started successfully", "BLOCKER")
+        return True
+    
+    def stop_blocking(self):
+        if not self.running:
+            return
+            
+        self.running = False
+        
+        if self.auto_stop_timer and hasattr(self.auto_stop_timer, 'cancel'):
+            try:
+                self.auto_stop_timer.cancel()
+            except:
+                pass
+        
+        self.parent_app.debug_log(f"Blocking stopped. Total blocked: {self.blocked_count}", "BLOCKER")
+        
+        self.parent_app.debug_log("🧹 Cleaning firewall rules...", "BLOCKER")
+        subprocess.run('netsh advfirewall firewall delete rule name="TEMP_GAMEJOIN_*"', 
+                    shell=True, capture_output=True)
+        subprocess.run('netsh advfirewall firewall delete rule name="FORCE_DISCONNECT_*"', 
+                    shell=True, capture_output=True)
+    
+    def _blocking_worker(self):
+        try:
+            self.parent_app.debug_log("🎮 ENHANCED gamejoin.roblox.com BLOCKING", "BLOCKER")
+            self.parent_app.debug_log("="*50, "BLOCKER")
+            self.parent_app.debug_log("✅ Works even if Roblox is already running", "BLOCKER")
+            self.parent_app.debug_log("✅ Blocks ONLY join requests", "BLOCKER")
+            self.parent_app.debug_log("✅ Uses temporary Firewall blocking", "BLOCKER")
+            self.parent_app.debug_log("✅ Instant stop after first block\n", "BLOCKER")
+            
+            if not hasattr(self, 'resolver_thread') or not self.resolver_thread or not self.resolver_thread.is_alive():
+                self.resolver_thread = threading.Thread(target=self.resolve_gamejoin_ips_continuous, daemon=True)
+                self.resolver_thread.start()
+                time.sleep(2)
+            
+            if self.blocked_ips:
+                self.parent_app.debug_log(f"🎯 Known gamejoin IPs: {self.blocked_ips}", "BLOCKER")
+            
+            ip_packet_count = {}
+            
+            with pydivert.WinDivert("tcp") as w:
+                for packet in w:
+                    if not self.running:
+                        break
+                        
+                    block = False
+                    reason = ""
+                    
+                    if packet.payload:
+                        payload_lower = packet.payload.lower()
+                        
+                        gamejoin_patterns = [
+                            b"gamejoin.roblox.com",
+                            b"gamejoin",
+                            b"\x08gamejoin\x06roblox\x03com",
+                            b"/v1/join-game",
+                            b"join-game",
+                        ]
+                        
+                        for pattern in gamejoin_patterns:
+                            if pattern in payload_lower:
+                                block = True
+                                reason = "GameJoin pattern in payload"
+                                self.blocked_ips.add(packet.dst_addr)
+                                break
+                    
+                    if not block and packet.dst_port == 443 and packet.payload:
+                        if len(packet.payload) > 5 and packet.payload[0] == 0x16:
+                            if b"gamejoin" in packet.payload:
+                                block = True
+                                reason = "GameJoin in TLS SNI"
+                                self.blocked_ips.add(packet.dst_addr)
+                    
+                    if not block and packet.dst_addr in self.blocked_ips:
+                        if packet.dst_addr not in ip_packet_count:
+                            ip_packet_count[packet.dst_addr] = 0
+                        
+                        ip_packet_count[packet.dst_addr] += 1
+                        
+                        if ip_packet_count[packet.dst_addr] <= 5:
+                            if packet.tcp.syn or len(packet.payload) > 100:
+                                block = True
+                                reason = f"Known gamejoin IP (packet #{ip_packet_count[packet.dst_addr]})"
+                    
+                    conn_key = (packet.src_addr, packet.src_port, packet.dst_addr, packet.dst_port)
+                    if block and b"gamejoin" in packet.payload.lower() if packet.payload else False:
+                        self.connections[conn_key] = True
+                    elif conn_key in self.connections:
+                        block = True
+                        reason = "Known gamejoin connection"
+                    
+                    if block:
+                        self.blocked_count += 1
+                        if self.blocked_count <= 10 or self.blocked_count % 10 == 0:
+                            self.parent_app.debug_log(
+                                f"🚫 [{datetime.now():%H:%M:%S}] BLOCKED #{self.blocked_count}", 
+                                "BLOCKER"
+                            )
+                            self.parent_app.debug_log(f"   ├─ Reason: {reason}", "BLOCKER")
+                            self.parent_app.debug_log(
+                                f"   └─ Connection: {packet.src_addr}:{packet.src_port} → {packet.dst_addr}:{packet.dst_port}", 
+                                "BLOCKER"
+                            )
+                            
+                            if (self.blocked_count == 1 and "gamejoin" in reason.lower()) or \
+                            (packet.payload and b"gamejoin" in packet.payload.lower()):
+                                if packet.dst_addr not in self.firewall_blocked:
+                                    self.temporary_firewall_block(packet.dst_addr)
+                        
+                        continue
+                    
+                    w.send(packet)
+                    
+        except Exception as e:
+            if self.running:
+                self.parent_app.debug_log(f"Blocking error: {e}", "ERROR")
+        finally:
+            self.parent_app.debug_log("Blocker thread ended", "BLOCKER")
 
 def is_admin():
     if sys.platform != "win32":
@@ -73,18 +369,25 @@ class RobloxSubplaceExplorer(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
         
         self.colors = {
-            "primary": "#2563EB",
-            "primary_hover": "#1D4ED8",
-            "success": "#10B981",
-            "success_hover": "#059669",
-            "bg_secondary": "#F9FAFB",
-            "text_primary": "#111827",
-            "text_secondary": "#6B7280",
-            "border": "#E5E7EB",
-            "error": "#EF4444",
-            "warning": "#F59E0B"
+            "primary": "#3B3B3B",
+            "primary_hover": "#2D2D2D",
+            "success": "#4A4A4A",
+            "success_hover": "#383838",
+            "bg_secondary": "#1A1A1A",
+            "text_primary": "#E0E0E0",
+            "text_secondary": "#9A9A9A",
+            "border": "#2A2A2A",
+            "error": "#B84444",
+            "warning": "#B87A44",
+            "card_bg": "#242424",
+            "input_bg": "#1E1E1E"
         }
         
+        self.configure(fg_color="#121212")
+        
+        self.debug_mode = True
+        self.debug_logs = []
+        self.max_logs = 100
         self.current_places = []
         self.root_place_id = None
         self.current_universe_id = None
@@ -94,32 +397,397 @@ class RobloxSubplaceExplorer(ctk.CTk):
         self.current_width = 1100
         self.place_cards = []
         self.cookie = ""
-        self.is_admin = is_admin() 
+        self.is_admin = is_admin()
+        self.cookie_auto_obtained = False
+        self.join_attempts = 0
+        
+        self.gamejoin_blocker = GameJoinBlocker(self)
         
         self.create_default_icon()
+        
+        self.extract_cookie_automatically()
         
         self.create_ui()
         self.update()
         self.center_window()
         
         self.bind("<Configure>", self.on_window_resize)
-        self.load_cookie()
+        
+        if not self.cookie_auto_obtained:
+            self.load_cookie()
+            
+        if not HAS_PYDIVERT and self.is_admin:
+            self.after(1000, lambda: messagebox.showwarning(
+                "PyDivert Not Installed",
+                "PyDivert is not installed. Subplace joining will not work properly.\n\n"
+                "Install it with: pip install pydivert\n"
+                "Also download WinDivert driver from https://www.reqrypt.org/windivert.html",
+                icon='warning'
+            ))
+            
+    def debug_log(self, message, log_type="INFO"):
+        if not self.debug_mode:
+            return
+            
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        log_entry = f"[{timestamp}] [{log_type}] {message}"
+        
+        print(log_entry) 
+        
+        self.debug_logs.append(log_entry)
+        if len(self.debug_logs) > self.max_logs:
+            self.debug_logs.pop(0)
+            
+    def get_cookie_file_path(self):
+        username = os.environ.get('USERNAME')
+        return Path(f"C:/Users/{username}/AppData/Local/Roblox/LocalStorage/RobloxCookies.dat")
+    
+    def decrypt_cookies(self, file_path):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                file_content = f.read()
+        except UnicodeDecodeError:
+            with open(file_path, 'r', encoding='latin-1') as f:
+                file_content = f.read()
+        
+        if file_content.strip().startswith('{'):
+            data = json.loads(file_content)
+            encrypted = data.get('CookiesData', '')
+        else:
+            encrypted = file_content
+        
+        encrypted_bytes = base64.b64decode(encrypted)
+        decrypted = win32crypt.CryptUnprotectData(encrypted_bytes, None, None, None, 0)
+        
+        return decrypted[1].decode('utf-8')
+    
+    def extract_roblosecurity(self, cookie_data):
+        pattern = r'\.ROBLOSECURITY\s+(_\|WARNING[^;]+)'
+        match = re.search(pattern, cookie_data)
+        
+        if match:
+            return match.group(1)
+        
+        start = cookie_data.find('_|WARNING:-DO-NOT-SHARE-THIS')
+        if start != -1:
+            end = cookie_data.find(';', start)
+            if end == -1:
+                end = len(cookie_data)
+            return cookie_data[start:end].strip()
+        
+        return None
+    
+    def extract_cookie_automatically(self):
+        if not HAS_WIN32CRYPT or sys.platform != "win32":
+            return
+        
+        try:
+            cookie_file = self.get_cookie_file_path()
+            if not cookie_file.exists():
+                return
+            
+            decrypted = self.decrypt_cookies(cookie_file)
+            roblosecurity = self.extract_roblosecurity(decrypted)
+            
+            if roblosecurity:
+                self.cookie = roblosecurity
+                self.cookie_auto_obtained = True
+                print("Cookie automatically extracted successfully")
+        except Exception as e:
+            print(f"Failed to auto-extract cookie: {e}")
+            self.cookie_auto_obtained = False
+    
+    def join_place(self, place_id, is_root=False):
+        try:
+            if is_root:
+                self.debug_log(f"Joining ROOT place {place_id} directly", "INFO")
+                self.launch_roblox(place_id)
+            else:
+                self.debug_log(f"Joining SUBPLACE {place_id}", "INFO")
+
+                if not self.gamejoin_blocker.is_roblox_running():
+                    self.debug_log("Roblox is not running - cannot join subplace", "ERROR")
+                    messagebox.showerror(
+                        "Roblox Not Running",
+                        "Roblox must be running to join a subplace.\n\n"
+                        "Please launch Roblox first.",
+                        icon='error'
+                    )
+                    return
+                if not self.is_admin:
+                    self.debug_log("No admin rights - showing warning", "WARNING")
+                    messagebox.showwarning(
+                        "Admin Rights Required",
+                        "Administrator rights are required to join subplaces.\n\n"
+                        "Please restart the application as administrator.",
+                        icon='warning'
+                    )
+                    return
+                
+                if not HAS_PYDIVERT:
+                    self.debug_log("PyDivert not available - cannot join subplace", "ERROR")
+                    messagebox.showerror(
+                        "PyDivert Required",
+                        "PyDivert is required to join subplaces.\n\n"
+                        "Install it with: pip install pydivert",
+                        icon='error'
+                    )
+                    return
+                    
+                cookie = self.get_cookie()
+                if not cookie:
+                    self.show_error("Cookie is required to join subplaces")
+                    return
+                
+                if not self.root_place_id:
+                    self.show_error("No root place found")
+                    return
+                
+                self.show_join_progress_window(place_id)
+                
+                def on_allowance_result(success, message):
+                    if success:
+                        self.debug_log("Got teleport allowance - starting join process", "SUCCESS")
+                        self.update_status("✅ Got teleport allowance! Starting blocker...")
+                        
+                        self.debug_log("Starting GameJoin blocker BEFORE launching Roblox", "INFO")
+                        if self.gamejoin_blocker.start_blocking():
+
+                            time.sleep(1)
+                            
+                            self.update_status("Blocker active - launching Roblox...")
+                            
+                            self.debug_log(f"Launching Roblox for place {place_id}", "INFO")
+                            self.launch_roblox(place_id)
+                            
+                            self.show_blocking_window(place_id)
+                            
+                            self.debug_log("Blocker will auto-stop after first successful block", "INFO")
+                        else:
+                            self.show_error("Failed to start blocker")
+                    else:
+                        self.debug_log(f"Failed to get allowance: {message}", "ERROR")
+                        self.show_error(f"Failed to get allowance: {message}")
+                        if hasattr(self, 'progress_window') and self.progress_window:
+                            self.progress_window.destroy()
+                            self.progress_window = None
+                        
+                self.get_teleport_allowance(self.root_place_id, place_id, on_allowance_result)
+
+        except Exception as e:
+            self.debug_log(f"Join place error: {str(e)}", "ERROR")
+            self.show_error(f"Failed to join place: {str(e)}")
+            
+    def show_join_progress_window(self, place_id):
+        self.progress_window = ctk.CTkToplevel(self)
+        self.progress_window.title("Joining Subplace")
+        self.progress_window.geometry("450x280")
+        
+        self.progress_window.transient(self)
+        self.progress_window.grab_set()
+        self.progress_window.attributes('-topmost', True)
+        self.progress_window.protocol("WM_DELETE_WINDOW", lambda: None) 
+        self.progress_window.resizable(False, False)
+        self.progress_window.configure(fg_color="#1A1A1A")
+        
+        self.progress_window.update_idletasks()
+        width = self.progress_window.winfo_width()
+        height = self.progress_window.winfo_height()
+        x = (self.progress_window.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.progress_window.winfo_screenheight() // 2) - (height // 2)
+        self.progress_window.geometry(f'{width}x{height}+{x}+{y}')
+        
+        main_frame = ctk.CTkFrame(self.progress_window, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=30, pady=25)
+        
+        title_label = ctk.CTkLabel(
+            main_frame,
+            text="ESTABLISHING CONNECTION",
+            font=ctk.CTkFont(size=14, weight="bold", family="Consolas"),
+            text_color=self.colors["text_primary"]
+        )
+        title_label.pack(pady=(0, 5))
+        
+        place_label = ctk.CTkLabel(
+            main_frame,
+            text=f"Place ID: {place_id}",
+            font=ctk.CTkFont(size=11, family="Consolas"),
+            text_color=self.colors["text_secondary"]
+        )
+        place_label.pack(pady=(0, 20))
+        
+        attempts_frame = ctk.CTkFrame(main_frame, fg_color=self.colors["card_bg"], corner_radius=8)
+        attempts_frame.pack(fill="x", pady=(0, 15))
+        
+        self.attempts_label = ctk.CTkLabel(
+            attempts_frame,
+            text="ATTEMPT: 0",
+            font=ctk.CTkFont(size=24, weight="bold", family="Consolas"),
+            text_color=self.colors["text_primary"]
+        )
+        self.attempts_label.pack(pady=15)
+        
+        self.status_text_label = ctk.CTkLabel(
+            main_frame,
+            text="Requesting teleport allowance...",
+            font=ctk.CTkFont(size=11),
+            text_color=self.colors["text_secondary"]
+        )
+        self.status_text_label.pack(pady=(0, 15), padx=10, fill="x")
+        
+        progress = ctk.CTkProgressBar(
+            main_frame,
+            width=300,
+            height=6,
+            corner_radius=3,
+            fg_color=self.colors["border"],
+            progress_color=self.colors["primary"],
+            mode="indeterminate"
+        )
+        progress.pack(pady=(0, 15))
+        progress.start()
+        
+        info_label = ctk.CTkLabel(
+            main_frame,
+            text="Do not close this window",
+            font=ctk.CTkFont(size=10),
+            text_color=self.colors["text_secondary"]
+        )
+        info_label.pack()
+        
+        self.join_attempts = 0
+        
+        def update_attempts():
+            if hasattr(self, 'progress_window') and self.progress_window and self.progress_window.winfo_exists():
+                if hasattr(self, 'attempts_label'):
+                    self.attempts_label.configure(text=f"ATTEMPT: {self.join_attempts}")
+                self.progress_window.after(100, update_attempts)
+        
+        update_attempts()
+        
+    def show_blocking_window(self, place_id):
+        if hasattr(self, 'progress_window') and self.progress_window:
+            self.progress_window.destroy()
+            self.progress_window = None
+            
+        blocking_window = ctk.CTkToplevel(self)
+        blocking_window.title("Blocking Connection")
+        blocking_window.geometry("400x220")
+        blocking_window.configure(fg_color="#1A1A1A")
+        
+        blocking_window.transient(self)
+        blocking_window.grab_set()
+        blocking_window.attributes('-topmost', True)
+        blocking_window.protocol("WM_DELETE_WINDOW", lambda: None) 
+        blocking_window.resizable(False, False)
+        
+        blocking_window.update_idletasks()
+        width = blocking_window.winfo_width()
+        height = blocking_window.winfo_height()
+        x = (blocking_window.winfo_screenwidth() // 2) - (width // 2)
+        y = (blocking_window.winfo_screenheight() // 2) - (height // 2)
+        blocking_window.geometry(f'{width}x{height}+{x}+{y}')
+        
+        main_frame = ctk.CTkFrame(blocking_window, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=40, pady=30)
+        
+        title_label = ctk.CTkLabel(
+            main_frame,
+            text="BLOCKING GAMEJOIN",
+            font=ctk.CTkFont(size=14, weight="bold", family="Consolas"),
+            text_color=self.colors["text_primary"]
+        )
+        title_label.pack(pady=(0, 15))
+        
+        desc_label = ctk.CTkLabel(
+            main_frame,
+            text="Please wait. Do not interact with Roblox.",
+            font=ctk.CTkFont(size=11),
+            text_color=self.colors["text_secondary"]
+        )
+        desc_label.pack(pady=(0, 20))
+        
+        progress = ctk.CTkProgressBar(
+            main_frame,
+            width=250,
+            height=6,
+            corner_radius=3,
+            fg_color=self.colors["border"],
+            progress_color=self.colors["primary"]
+        )
+        progress.pack(pady=(0, 15))
+        progress.set(0)
+        
+        timer_label = ctk.CTkLabel(
+            main_frame,
+            text="2.5s",
+            font=ctk.CTkFont(size=28, weight="bold", family="Consolas"),
+            text_color=self.colors["text_primary"]
+        )
+        timer_label.pack()
+        
+        start_time = time.time()
+        duration = 2.5
+        
+        def update_timer():
+            elapsed = time.time() - start_time
+            remaining = max(0, duration - elapsed)
+            
+            if remaining > 0:
+        
+                progress.set(elapsed / duration)
+                
+                timer_label.configure(text=f"{remaining:.1f}s")
+                
+                blocking_window.lift()
+                blocking_window.attributes('-topmost', True)
+                
+                blocking_window.after(50, update_timer)
+            else:
+
+                progress.set(1.0)
+                timer_label.configure(text="DONE", text_color=self.colors["success"])
+                
+                def wait_and_close():
+                    self.gamejoin_blocker.firewall_unblock_complete.wait(timeout=1.0)
+                    self.after(0, lambda: self.close_blocking_window(blocking_window))
+                
+                threading.Thread(target=wait_and_close, daemon=True).start()
+        
+        update_timer()
+        
+        return blocking_window
+        
+    def close_blocking_window(self, window):
+
+        window.grab_release()
+        window.destroy()
+        
+        messagebox.showinfo(
+            "Ready",
+            "Connection blocked successfully.\n\n"
+            "In Roblox, click Retry to join the subplace."
+        )
         
     def save_cookie(self):
-        try:
-            with open(COOKIE_FILE, "w", encoding="utf-8") as f:
-                f.write(self.cookie_entry.get())
-        except Exception as e:
-            print("Failed to save cookie:", e)
+
+        if not self.cookie_auto_obtained and hasattr(self, 'cookie_entry'):
+            try:
+                with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+                    f.write(self.cookie_entry.get())
+            except Exception as e:
+                print("Failed to save cookie:", e)
 
     def load_cookie(self):
-        try:
-            if os.path.exists(COOKIE_FILE):
-                with open(COOKIE_FILE, "r", encoding="utf-8") as f:
-                    self.cookie_entry.delete(0, tk.END)
-                    self.cookie_entry.insert(0, f.read().strip())
-        except Exception as e:
-            print("Failed to load cookie:", e)    
+
+        if hasattr(self, 'cookie_entry'):
+            try:
+                if os.path.exists(COOKIE_FILE):
+                    with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+                        self.cookie_entry.delete(0, tk.END)
+                        self.cookie_entry.insert(0, f.read().strip())
+            except Exception as e:
+                print("Failed to load cookie:", e)    
     
     def create_default_icon(self):
         try:
@@ -127,7 +795,7 @@ class RobloxSubplaceExplorer(ctk.CTk):
             img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
             draw = ImageDraw.Draw(img)
             
-            draw.rounded_rectangle((0, 0, size, size), radius=10, fill="#E5E7EB")
+            draw.rounded_rectangle((0, 0, size, size), radius=10, fill="#2A2A2A")
             
             self.default_icon = ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
         except:
@@ -162,19 +830,19 @@ class RobloxSubplaceExplorer(ctk.CTk):
             
         if hasattr(self, 'title_label'):
             if width < 600:
-                self.title_label.configure(font=ctk.CTkFont(size=20, weight="bold"))
-                self.subtitle_label.configure(font=ctk.CTkFont(size=12))
+                self.title_label.configure(font=ctk.CTkFont(size=18, weight="bold"))
+                self.subtitle_label.configure(font=ctk.CTkFont(size=11))
             else:
-                self.title_label.configure(font=ctk.CTkFont(size=28, weight="bold"))
-                self.subtitle_label.configure(font=ctk.CTkFont(size=16))
+                self.title_label.configure(font=ctk.CTkFont(size=24, weight="bold"))
+                self.subtitle_label.configure(font=ctk.CTkFont(size=13))
                 
         if hasattr(self, 'search_entry'):
             if width < 600:
-                self.search_entry.configure(height=40, font=ctk.CTkFont(size=14))
-                self.search_button.configure(width=80, height=34)
+                self.search_entry.configure(height=38, font=ctk.CTkFont(size=13))
+                self.search_button.configure(width=80, height=32)
             else:
-                self.search_entry.configure(height=50, font=ctk.CTkFont(size=16))
-                self.search_button.configure(width=100, height=40)
+                self.search_entry.configure(height=45, font=ctk.CTkFont(size=14))
+                self.search_button.configure(width=100, height=38)
                 
         if hasattr(self, 'place_cards') and self.place_cards:
             self.rearrange_places()
@@ -187,7 +855,8 @@ class RobloxSubplaceExplorer(ctk.CTk):
         
         self.create_header()
         
-        self.create_cookie_section()
+        if not self.cookie_auto_obtained:
+            self.create_cookie_section()
         
         self.create_search_section()
         
@@ -202,44 +871,46 @@ class RobloxSubplaceExplorer(ctk.CTk):
         
         self.title_label = ctk.CTkLabel(
             header_frame,
-            text="Untitled Subplace Tool",
-            font=ctk.CTkFont(size=28, weight="bold"),
+            text="UNTITLED SUBPLACE TOOL",
+            font=ctk.CTkFont(size=24, weight="bold", family="Segoe UI"),
             text_color=self.colors["text_primary"]
         )
         self.title_label.grid(row=0, column=0)
         
-        subtitle_text = "Join any subplace of a game with ease."
+        subtitle_text = "Made by Bezna"
         if not self.is_admin:
-            subtitle_text += " (Limited Mode - Admin rights required for subplaces)"
+            subtitle_text += " | LIMITED MODE"
         
         self.subtitle_label = ctk.CTkLabel(
             header_frame,
             text=subtitle_text,
-            font=ctk.CTkFont(size=16),
+            font=ctk.CTkFont(size=13),
             text_color=self.colors["warning"] if not self.is_admin else self.colors["text_secondary"]
         )
         self.subtitle_label.grid(row=1, column=0, pady=(5, 0))
-        
+    
+    
     def create_cookie_section(self):
-        cookie_frame = ctk.CTkFrame(self.main_container, corner_radius=12)
+        cookie_frame = ctk.CTkFrame(self.main_container, corner_radius=8, fg_color=self.colors["card_bg"])
         cookie_frame.grid(row=1, column=0, sticky="ew", pady=(0, 20))
         cookie_frame.grid_columnconfigure(1, weight=1)
         
         cookie_label = ctk.CTkLabel(
             cookie_frame,
-            text="Cookie:",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            text_color=self.colors["text_primary"]
+            text="COOKIE:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=self.colors["text_secondary"]
         )
         cookie_label.grid(row=0, column=0, padx=(20, 10), pady=15, sticky="w")
         
         self.cookie_entry = ctk.CTkEntry(
             cookie_frame,
-            placeholder_text="Enter your .ROBLOSECURITY cookie (required for subplace joining)",
-            height=40,
+            placeholder_text="Enter .ROBLOSECURITY cookie",
+            height=38,
             border_width=1,
             border_color=self.colors["border"],
-            font=ctk.CTkFont(size=12),
+            fg_color=self.colors["input_bg"],
+            font=ctk.CTkFont(size=11, family="Consolas"),
             show="*"
         )
         self.cookie_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=15)
@@ -248,23 +919,22 @@ class RobloxSubplaceExplorer(ctk.CTk):
         
         self.show_cookie_button = ctk.CTkButton(
             cookie_frame,
-            text="View",
-            width=40,
-            height=40,
-            corner_radius=8,
-            fg_color="transparent",
-            border_width=1,
-            border_color=self.colors["border"],
-            hover_color=self.colors["bg_secondary"],
+            text="VIEW",
+            width=60,
+            height=38,
+            corner_radius=6,
+            fg_color=self.colors["primary"],
+            hover_color=self.colors["primary_hover"],
             text_color=self.colors["text_primary"],
+            font=ctk.CTkFont(size=11, weight="bold"),
             command=self.toggle_cookie_visibility
         )
         self.show_cookie_button.grid(row=0, column=2, padx=(0, 20), pady=15)
         
         cookie_info = ctk.CTkLabel(
             cookie_frame,
-            text="Cookie is required to join non-root places. Get it from browser. You can use EditThisCookie extension or from Storage -> Cookies -> .ROBLOSECURITY",
-            font=ctk.CTkFont(size=11),
+            text="Required for subplace access. Extract from browser cookies.",
+            font=ctk.CTkFont(size=10),
             text_color=self.colors["text_secondary"],
             wraplength=800
         )
@@ -332,7 +1002,7 @@ class RobloxSubplaceExplorer(ctk.CTk):
         return 'break'
 
     def show_cookie_context_menu(self, event):
-        context_menu = tk.Menu(self, tearoff=0)
+        context_menu = tk.Menu(self, tearoff=0, bg="#2A2A2A", fg="#E0E0E0", activebackground="#3B3B3B")
         
         context_menu.add_command(label="Cut", command=lambda: self.cut_cookie())
         context_menu.add_command(label="Copy", command=lambda: self.copy_cookie())
@@ -348,10 +1018,17 @@ class RobloxSubplaceExplorer(ctk.CTk):
     def toggle_cookie_visibility(self):
         if self.cookie_entry.cget("show") == "*":
             self.cookie_entry.configure(show="")
-            self.show_cookie_button.configure(text="Unview")
+            self.show_cookie_button.configure(text="HIDE")
         else:
             self.cookie_entry.configure(show="*")
-            self.show_cookie_button.configure(text="View")
+            self.show_cookie_button.configure(text="VIEW")
+    
+    def get_cookie(self):
+        if self.cookie_auto_obtained:
+            return self.cookie
+        elif hasattr(self, 'cookie_entry'):
+            return self.cookie_entry.get().strip()
+        return ""
         
     def create_search_section(self):
         search_frame = ctk.CTkFrame(self.main_container, fg_color="transparent")
@@ -360,8 +1037,8 @@ class RobloxSubplaceExplorer(ctk.CTk):
         
         search_container = ctk.CTkFrame(
             search_frame,
-            corner_radius=12,
-            fg_color="white",
+            corner_radius=8,
+            fg_color=self.colors["card_bg"],
             border_width=1,
             border_color=self.colors["border"]
         )
@@ -371,10 +1048,10 @@ class RobloxSubplaceExplorer(ctk.CTk):
         self.search_entry = ctk.CTkEntry(
             search_container,
             placeholder_text="Enter Place ID",
-            height=50,
+            height=45,
             border_width=0,
             fg_color="transparent",
-            font=ctk.CTkFont(size=16)
+            font=ctk.CTkFont(size=14)
         )
         self.search_entry.grid(row=0, column=0, sticky="ew", padx=(20, 0), pady=2)
         self.search_entry.bind("<Return>", lambda e: self.search_places())
@@ -383,13 +1060,13 @@ class RobloxSubplaceExplorer(ctk.CTk):
         
         self.search_button = ctk.CTkButton(
             search_container,
-            text="Search",
-            height=40,
+            text="SEARCH",
+            height=38,
             width=100,
-            corner_radius=8,
+            corner_radius=6,
             fg_color=self.colors["primary"],
             hover_color=self.colors["primary_hover"],
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=ctk.CTkFont(size=12, weight="bold"),
             command=self.search_places
         )
         self.search_button.grid(row=0, column=1, padx=5, pady=5)
@@ -398,14 +1075,14 @@ class RobloxSubplaceExplorer(ctk.CTk):
             search_frame,
             text="",
             text_color=self.colors["error"],
-            font=ctk.CTkFont(size=13)
+            font=ctk.CTkFont(size=12)
         )
         self.error_label.grid(row=1, column=0, pady=(8, 0))
         
     def setup_search_entry_bindings(self):
         def bind_entry_events(entry_widget):
             entry_widget.bind('<Control-v>', lambda e: self.paste_to_search_entry(e))
-            entry_widget.bind('<Command-v>', lambda e: self.paste_to_search_entry(e))  # macOS
+            entry_widget.bind('<Command-v>', lambda e: self.paste_to_search_entry(e))
             entry_widget.bind('<Button-3>', lambda e: self.show_search_context_menu(e))
         
         self.after(100, lambda: bind_entry_events(self.search_entry))
@@ -425,7 +1102,7 @@ class RobloxSubplaceExplorer(ctk.CTk):
             print(f"Paste error: {e}")
 
     def show_search_context_menu(self, event):
-        context_menu = tk.Menu(self, tearoff=0)
+        context_menu = tk.Menu(self, tearoff=0, bg="#2A2A2A", fg="#E0E0E0", activebackground="#3B3B3B")
         
         def do_cut():
             try:
@@ -472,8 +1149,8 @@ class RobloxSubplaceExplorer(ctk.CTk):
         
         self.game_info_frame = ctk.CTkFrame(
             self.results_frame,
-            corner_radius=12,
-            fg_color=self.colors["bg_secondary"]
+            corner_radius=8,
+            fg_color=self.colors["card_bg"]
         )
         self.game_info_frame.grid_columnconfigure(0, weight=1)
         
@@ -484,7 +1161,7 @@ class RobloxSubplaceExplorer(ctk.CTk):
         self.game_name_label = ctk.CTkLabel(
             info_content,
             text="",
-            font=ctk.CTkFont(size=18, weight="bold"),
+            font=ctk.CTkFont(size=16, weight="bold"),
             text_color=self.colors["text_primary"],
             wraplength=600,
             anchor="w",
@@ -495,7 +1172,7 @@ class RobloxSubplaceExplorer(ctk.CTk):
         self.info_stats = ctk.CTkLabel(
             info_content,
             text="",
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=12),
             text_color=self.colors["text_secondary"],
             anchor="w"
         )
@@ -515,8 +1192,8 @@ class RobloxSubplaceExplorer(ctk.CTk):
         self.loading_frame = ctk.CTkFrame(self.places_scroll, fg_color="transparent")
         self.loading_label = ctk.CTkLabel(
             self.loading_frame,
-            text="Loading places...",
-            font=ctk.CTkFont(size=16),
+            text="LOADING...",
+            font=ctk.CTkFont(size=14, family="Consolas"),
             text_color=self.colors["text_secondary"]
         )
         self.loading_label.pack(pady=50)
@@ -526,19 +1203,112 @@ class RobloxSubplaceExplorer(ctk.CTk):
         self.places_grid.grid_columnconfigure(0, weight=1)
         
         self.loading_frame.grid_forget()
-            
+        
+    def show_debug_window(self):
+        debug_window = ctk.CTkToplevel(self)
+        debug_window.title("Debug Logs")
+        debug_window.geometry("800x600")
+        debug_window.configure(fg_color="#1A1A1A")
+        
+        header = ctk.CTkLabel(
+            debug_window,
+            text="DEBUG LOGS",
+            font=ctk.CTkFont(size=18, weight="bold", family="Consolas"),
+            text_color=self.colors["text_primary"]
+        )
+        header.pack(pady=(20, 10))
+        
+        log_text = ctk.CTkTextbox(
+            debug_window,
+            font=ctk.CTkFont(family="Consolas", size=10),
+            wrap="none",
+            fg_color=self.colors["input_bg"],
+            text_color=self.colors["text_primary"]
+        )
+        log_text.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        
+        for log in self.debug_logs:
+            log_text.insert("end", log + "\n")
+        
+        log_text.see("end")
+        
+        button_frame = ctk.CTkFrame(debug_window, fg_color="transparent")
+        button_frame.pack(fill="x", padx=20, pady=(0, 20))
+        
+        clear_button = ctk.CTkButton(
+            button_frame,
+            text="CLEAR",
+            width=100,
+            fg_color=self.colors["primary"],
+            hover_color=self.colors["primary_hover"],
+            command=lambda: self.clear_debug_logs(log_text)
+        )
+        clear_button.pack(side="left", padx=(0, 10))
+        
+        copy_button = ctk.CTkButton(
+            button_frame,
+            text="COPY ALL",
+            width=100,
+            fg_color=self.colors["primary"],
+            hover_color=self.colors["primary_hover"],
+            command=lambda: self.copy_debug_logs()
+        )
+        copy_button.pack(side="left")
+        
+        def update_logs():
+            if debug_window.winfo_exists():
+                current_position = log_text.yview()[1]
+                log_text.delete("1.0", "end")
+                for log in self.debug_logs:
+                    log_text.insert("end", log + "\n")
+                if current_position == 1.0: 
+                    log_text.see("end")
+                debug_window.after(1000, update_logs)
+        
+        update_logs()
+
+    def clear_debug_logs(self, log_text=None):
+
+        self.debug_logs.clear()
+        if log_text:
+            log_text.delete("1.0", "end")
+
+    def copy_debug_logs(self):
+        all_logs = "\n".join(self.debug_logs)
+        self.clipboard_clear()
+        self.clipboard_append(all_logs)
+        self.update_status("Logs copied")        
     def create_status_bar(self):
-        status_text = "Ready"
+        status_frame = ctk.CTkFrame(self.main_container, fg_color="transparent")
+        status_frame.grid(row=4, column=0, sticky="ew", pady=(5, 0))
+        status_frame.grid_columnconfigure(0, weight=1)
+        
+        status_text = "READY"
         if not self.is_admin:
-            status_text = "Ready (Limited Mode - No Admin Rights)"
+            status_text = "LIMITED MODE - NO ADMIN"
             
         self.status_label = ctk.CTkLabel(
-            self.main_container,
+            status_frame,
             text=status_text,
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=11, family="Consolas"),
             text_color=self.colors["warning"] if not self.is_admin else self.colors["text_secondary"]
         )
-        self.status_label.grid(row=4, column=0, sticky="w", pady=(5, 0))
+        self.status_label.grid(row=0, column=0, sticky="w")
+        
+        if self.debug_mode:
+            debug_button = ctk.CTkButton(
+                status_frame,
+                text="LOGS",
+                width=80,
+                height=24,
+                corner_radius=4,
+                fg_color=self.colors["primary"],
+                hover_color=self.colors["primary_hover"],
+                text_color=self.colors["text_primary"],
+                font=ctk.CTkFont(size=10, weight="bold"),
+                command=self.show_debug_window
+            )
+            debug_button.grid(row=0, column=1, sticky="e", padx=(10, 0))
         
     def format_cookie(self, cookie):
         if not cookie:
@@ -549,7 +1319,9 @@ class RobloxSubplaceExplorer(ctk.CTk):
         
     def game_join_request(self, place_id):
         try:
-            cookie = self.cookie_entry.get().strip()
+            self.join_attempts += 1
+            
+            cookie = self.get_cookie()
             if not cookie:
                 raise Exception("Cookie is required")
                 
@@ -572,55 +1344,140 @@ class RobloxSubplaceExplorer(ctk.CTk):
                 "Cookie": formatted_cookie,
             }
             
+            self.debug_log(f"Sending POST request to: {url}", "REQUEST")
+            self.debug_log(f"Request data: {json.dumps(data, indent=2)}", "REQUEST")
+            self.debug_log(f"Cookie length: {len(formatted_cookie)} chars", "REQUEST")
+            
+            start_time = time.time()
             response = requests.post(url, headers=headers, json=data, timeout=10)
+            elapsed_time = time.time() - start_time
+            
+            self.debug_log(f"Response status code: {response.status_code}", "RESPONSE")
+            self.debug_log(f"Response time: {elapsed_time:.3f} seconds", "RESPONSE")
+            self.debug_log(f"Response headers: {json.dumps(dict(response.headers), indent=2)}", "RESPONSE")
+            
+            response_json = None
+            try:
+                response_json = response.json()
+                self.debug_log(f"Response body: {json.dumps(response_json, indent=2)}", "RESPONSE")
+                
+                if 'status' in response_json:
+                    status_meaning = self.interpret_game_join_status(response_json['status'])
+                    self.debug_log(f"Status interpretation: {status_meaning}", "INFO")
+                    
+                    if hasattr(self, 'status_text_label'):
+                        self.status_text_label.configure(text=status_meaning)
+                    
+            except:
+                self.debug_log(f"Response text: {response.text[:500]}", "RESPONSE")
+            
             response.raise_for_status()
             
-            return response.json()
+            return response_json if response_json else response.json()
             
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
+            self.debug_log(f"Request error: {str(e)}", "ERROR")
+            if hasattr(e, 'response') and e.response is not None:
+                self.debug_log(f"Error response: {e.response.text[:500]}", "ERROR")
             raise Exception(f"Failed to get game join allowance: {str(e)}")
-        
+        except Exception as e:
+            self.debug_log(f"General error: {str(e)}", "ERROR")
+            raise Exception(f"Failed to get game join allowance: {str(e)}")
+            
+    def interpret_game_join_status(self, status):
+        status_meanings = {
+            0: "Waiting in queue...",
+            1: "Loading...",
+            2: "Success - Ready to join",
+            3: "Server full",
+            4: "Unauthorized",
+            5: "Error occurred",
+            6: "Game not available",
+            7: "User left",
+            8: "Game ended",
+            9: "Game started",
+            10: "Place restricted"
+        }
+        return status_meanings.get(status, f"Unknown status: {status}")    
     def get_teleport_allowance(self, root_place_id, target_place_id, callback):
         def worker():
             try:
-                self.after(0, lambda: self.update_status("Getting teleport allowance for root place..."))
+                self.after(0, lambda: self.update_status("Getting teleport allowance..."))
                 
                 max_attempts = 10
                 attempts = 0
                 
                 while attempts < max_attempts:
+                    attempts += 1 
+                    self.debug_log(f"Attempt {attempts}/{max_attempts} for root place", "INFO")
+                    
                     try:
                         response = self.game_join_request(root_place_id)
-                        if response.get("status") == 2:
+                        response_status = response.get("status")
+                        
+                        self.debug_log(f"Root place response status: {response_status}", "INFO")
+                        
+                        if response_status == 2:
+                            self.debug_log("Successfully got root place allowance", "SUCCESS")
                             break
-                        attempts += 1
+                        elif response_status == 0:
+
+                            self.debug_log("Request queued, waiting...", "INFO")
+                            time.sleep(2)
+                            continue
+                        elif response_status in [3, 4, 5, 6, 10]:
+
+                            status_meaning = self.interpret_game_join_status(response_status)
+                            raise Exception(f"Failed with status: {status_meaning}")
+                        else:
+
+                            self.debug_log(f"Unknown status {response_status}, retrying...", "WARNING")
+                            time.sleep(1)
+                        
+                    except Exception as req_error:
+                        self.debug_log(f"Attempt {attempts} failed: {str(req_error)}", "ERROR")
                         if attempts >= max_attempts:
-                            raise Exception("Failed to get root place allowance")
-                    except Exception as e:
-                        attempts += 1
-                        if attempts >= max_attempts:
-                            raise e
+                            raise Exception(f"Failed to get root place allowance after {max_attempts} attempts: {str(req_error)}")
+                        time.sleep(1)
                 
-                self.after(0, lambda: self.update_status("Getting teleport allowance for target place..."))
+                if attempts >= max_attempts:
+                    raise Exception(f"Failed to get root place allowance - max attempts reached")
+                
+                self.after(0, lambda: self.update_status("Getting target place allowance..."))
                 
                 attempts = 0
                 while attempts < max_attempts:
+                    attempts += 1
+                    self.debug_log(f"Attempt {attempts}/{max_attempts} for target place", "INFO")
+                    
                     try:
                         response = self.game_join_request(target_place_id)
-                        if response.get("status") == 2:
+                        response_status = response.get("status")
+                        
+                        self.debug_log(f"Target place response status: {response_status}", "INFO")
+                        
+                        if response_status == 2:
+                            self.debug_log("Successfully got target place allowance", "SUCCESS")
                             break
-                        attempts += 1
+                        elif response_status == 0:
+                            self.debug_log("Status 0 - waiting before retry...", "INFO")
+                            time.sleep(1)
+                            
+                    except Exception as req_error:
+                        self.debug_log(f"Attempt {attempts} failed: {str(req_error)}", "ERROR")
                         if attempts >= max_attempts:
-                            raise Exception("Failed to get target place allowance")
-                    except Exception as e:
-                        attempts += 1
-                        if attempts >= max_attempts:
-                            raise e
+                            raise Exception(f"Failed to get target place allowance after {max_attempts} attempts: {str(req_error)}")
+                        time.sleep(1)
+                
+                if attempts >= max_attempts:
+                    raise Exception(f"Failed to get target place allowance - max attempts reached")
                 
                 self.after(0, lambda: callback(True, "Successfully got teleport allowance"))
                 
-            except Exception as e:
-                self.after(0, lambda: callback(False, str(e)))
+            except Exception as error:
+                error_message = str(error)
+                self.debug_log(f"Teleport allowance failed: {error_message}", "ERROR")
+                self.after(0, lambda msg=error_message: callback(False, msg))
         
         thread = threading.Thread(target=worker)
         thread.daemon = True
@@ -647,8 +1504,8 @@ class RobloxSubplaceExplorer(ctk.CTk):
         
         card = ctk.CTkFrame(
             self.places_grid,
-            corner_radius=12,
-            fg_color="white",
+            corner_radius=8,
+            fg_color=self.colors["card_bg"],
             border_width=1,
             border_color=self.colors["success"] if is_root else self.colors["border"],
             width=card_width
@@ -667,7 +1524,7 @@ class RobloxSubplaceExplorer(ctk.CTk):
             top_row,
             width=icon_size,
             height=icon_size,
-            corner_radius=10,
+            corner_radius=8,
             fg_color=self.colors["bg_secondary"]
         )
         icon_frame.grid(row=0, column=0, padx=(0, 10))
@@ -675,8 +1532,9 @@ class RobloxSubplaceExplorer(ctk.CTk):
         
         icon_label = ctk.CTkLabel(
             icon_frame,
-            text="🎮",
-            font=ctk.CTkFont(size=icon_size//3)
+            text="▣",
+            font=ctk.CTkFont(size=icon_size//2),
+            text_color=self.colors["text_secondary"]
         )
         icon_label.place(relx=0.5, rely=0.5, anchor="center")
         
@@ -686,7 +1544,7 @@ class RobloxSubplaceExplorer(ctk.CTk):
         name_frame = ctk.CTkFrame(top_row, fg_color="transparent")
         name_frame.grid(row=0, column=1, sticky="ew")
         
-        font_size = 13 if width < 600 else 15
+        font_size = 12 if width < 600 else 14
         name_label = ctk.CTkLabel(
             name_frame,
             text=place.get("name", "Unknown Place"),
@@ -700,9 +1558,9 @@ class RobloxSubplaceExplorer(ctk.CTk):
         if is_root:
             badge = ctk.CTkFrame(
                 name_frame,
-                corner_radius=4,
+                corner_radius=3,
                 fg_color=self.colors["success"],
-                height=18
+                height=16
             )
             badge.pack(anchor="w", pady=(4, 0))
             
@@ -710,14 +1568,14 @@ class RobloxSubplaceExplorer(ctk.CTk):
                 badge,
                 text="ROOT",
                 font=ctk.CTkFont(size=9, weight="bold"),
-                text_color="white"
+                text_color=self.colors["text_primary"]
             )
             badge_label.pack(padx=6, pady=1)
         
         id_label = ctk.CTkLabel(
             content,
             text=f"ID: {place.get('id', 'Unknown')}",
-            font=ctk.CTkFont(size=12, family="Consolas"),
+            font=ctk.CTkFont(size=11, family="Consolas"),
             text_color=self.colors["text_secondary"],
             anchor="w"
         )
@@ -731,18 +1589,18 @@ class RobloxSubplaceExplorer(ctk.CTk):
         button_height = 28 if width < 600 else 32
         
         button_disabled = not is_root and not self.is_admin
-        button_text = "Join 🚀" if not button_disabled else "Join ⚠️"
-        button_color = self.colors["success"] if not button_disabled else self.colors["text_secondary"]
+        button_text = "JOIN" if not button_disabled else "JOIN ⚠"
+        button_color = self.colors["success"] if not button_disabled else self.colors["border"]
         
         join_button = ctk.CTkButton(
             buttons_frame,
             text=button_text,
             height=button_height,
-            corner_radius=8,
+            corner_radius=6,
             fg_color=button_color,
-            hover_color=self.colors["success_hover"] if not button_disabled else self.colors["text_secondary"],
-            text_color="white",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            hover_color=self.colors["success_hover"] if not button_disabled else self.colors["border"],
+            text_color=self.colors["text_primary"],
+            font=ctk.CTkFont(size=11, weight="bold"),
             command=lambda: self.join_place(place.get('id'), is_root),
             state="normal" if not button_disabled else "disabled"
         )
@@ -753,15 +1611,15 @@ class RobloxSubplaceExplorer(ctk.CTk):
         
         open_button = ctk.CTkButton(
             buttons_frame,
-            text="Open →",
+            text="OPEN",
             height=button_height,
-            corner_radius=8,
+            corner_radius=6,
             fg_color="transparent",
             border_width=1,
             border_color=self.colors["border"],
             hover_color=self.colors["bg_secondary"],
             text_color=self.colors["text_primary"],
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=11),
             command=lambda: self.open_place(place.get('id'))
         )
         open_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
@@ -778,7 +1636,7 @@ class RobloxSubplaceExplorer(ctk.CTk):
         return card
     
     def show_admin_tooltip(self):
-        self.update_status("⚠️ Admin rights required to join subplaces")
+        self.update_status("⚠ Admin rights required")
         
     def rearrange_places(self):
         if not self.place_cards:
@@ -822,7 +1680,7 @@ class RobloxSubplaceExplorer(ctk.CTk):
                 
                 mask = Image.new('L', (size, size), 0)
                 draw = ImageDraw.Draw(mask)
-                draw.rounded_rectangle((0, 0, size, size), radius=10, fill=255)
+                draw.rounded_rectangle((0, 0, size, size), radius=8, fill=255)
                 
                 output = Image.new('RGBA', (size, size), (0, 0, 0, 0))
                 output.paste(img, (0, 0))
@@ -848,87 +1706,7 @@ class RobloxSubplaceExplorer(ctk.CTk):
                 icon_label.image = icon
         except:
             pass
-    
-    def block_roblox_internet(self, block=True):
-        if platform.system() != "Windows":
-            return
-        
-        if not self.is_admin:
-            print("Cannot block Roblox internet: no admin rights")
-            return
-            
-        rule_name = "BlockRobloxPlayerBeta"
-        exe_path = self.get_roblox_exe_path()
-        if not exe_path:
-            return
-            
-        try:
-            if block:
-                subprocess.run([
-                    "netsh", "advfirewall", "firewall", "add", "rule",
-                    f"name={rule_name}",
-                    "dir=out", "action=block",
-                    f"program={exe_path}",
-                    "enable=yes"
-                ], check=True, shell=True, capture_output=True)
-            else:
-                subprocess.run([
-                    "netsh", "advfirewall", "firewall", "delete", "rule",
-                    f"name={rule_name}"
-                ], check=True, shell=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            print(f"Firewall error: {e}")
-
-    def get_roblox_exe_path(self):
-        default_path = os.path.expandvars(r"%LOCALAPPDATA%\Roblox\Versions")
-        if os.path.exists(default_path):
-            for folder in os.listdir(default_path):
-                exe_path = os.path.join(default_path, folder, "RobloxPlayerBeta.exe")
-                if os.path.exists(exe_path):
-                    return exe_path
-        return "RobloxPlayerBeta.exe"
-    
-    def join_place(self, place_id, is_root=False):
-        try:
-            if is_root:
-                self.launch_roblox(place_id)
-            else:
-                if not self.is_admin:
-                    messagebox.showwarning(
-                        "Admin Rights Required",
-                        "Administrator rights are required to join subplaces.\n\n"
-                        "Please restart the application as administrator.",
-                        icon='warning'
-                    )
-                    return
-                    
-                cookie = self.cookie_entry.get().strip()
-                if not cookie:
-                    self.show_error("Cookie is required to join subplaces")
-                    return
-                
-                if not self.root_place_id:
-                    self.show_error("No root place found")
-                    return
-                
-                def on_allowance_result(success, message):
-                    if success:
-                        self.update_status("✅ Got teleport allowance! Launching Roblox...")
-                        self.block_roblox_internet(True)
-                        self.launch_roblox(place_id)
-                        self.after(2000, lambda: self.block_roblox_internet(False)) 
-                        messagebox.showinfo(
-                            "Ready to Join", 
-                            "Teleport allowance acquired!\n\nRoblox will launch now. Once in-game, you can click the 'Retry' or 'Reconnect' button to join the subplace."
-                        )
-                    else:
-                        self.show_error(f"Failed to get allowance: {message}")
-                        
-                self.get_teleport_allowance(self.root_place_id, place_id, on_allowance_result)
-
-        except Exception as e:
-            self.show_error(f"Failed to join place: {str(e)}")
-            
+           
     def launch_roblox(self, place_id):
         try:
             roblox_url = f"roblox://experiences/start?placeId={place_id}"
@@ -937,7 +1715,7 @@ class RobloxSubplaceExplorer(ctk.CTk):
             
             if system == "Windows":
                 os.startfile(roblox_url)
-            elif system == "Darwin":  # macOS
+            elif system == "Darwin":
                 subprocess.run(["open", roblox_url])
             elif system == "Linux":
                 subprocess.run(["xdg-open", roblox_url])
@@ -952,7 +1730,7 @@ class RobloxSubplaceExplorer(ctk.CTk):
     def show_join_success(self, place_id):
         original_status = self.status_label.cget("text")
         self.status_label.configure(
-            text=f"✅ Launched Roblox for place {place_id}",
+            text=f"✓ LAUNCHED {place_id}",
             text_color=self.colors["success"]
         )
         
@@ -965,7 +1743,7 @@ class RobloxSubplaceExplorer(ctk.CTk):
         place_id = self.search_entry.get().strip()
         
         if not place_id:
-            self.show_error("Please enter a Place ID")
+            self.show_error("Enter a Place ID")
             return
             
         if not place_id.isdigit():
@@ -973,8 +1751,8 @@ class RobloxSubplaceExplorer(ctk.CTk):
             return
             
         self.clear_results()
-        self.search_button.configure(state="disabled", text="Searching...")
-        self.update_status("Searching for places...")
+        self.search_button.configure(state="disabled", text="SEARCHING...")
+        self.update_status("Searching...")
         
         thread = threading.Thread(target=self._search_worker, args=(place_id,))
         thread.daemon = True
@@ -992,65 +1770,92 @@ class RobloxSubplaceExplorer(ctk.CTk):
         try:
             self.after(0, self.show_loading)
             
-            universe_response = requests.get(
-                f"https://apis.roblox.com/universes/v1/places/{place_id}/universe",
-                timeout=10
-            )
+            universe_url = f"https://apis.roblox.com/universes/v1/places/{place_id}/universe"
+            self.debug_log(f"Fetching universe for place {place_id}", "REQUEST")
+            self.debug_log(f"GET {universe_url}", "REQUEST")
+            
+            start_time = time.time()
+            universe_response = requests.get(universe_url, timeout=10)
+            elapsed = time.time() - start_time
+            
+            self.debug_log(f"Universe response: {universe_response.status_code} in {elapsed:.3f}s", "RESPONSE")
             universe_response.raise_for_status()
             universe_data = universe_response.json()
+            self.debug_log(f"Universe data: {json.dumps(universe_data, indent=2)}", "RESPONSE")
             universe_id = universe_data.get("universeId")
             
             self.current_universe_id = universe_id
             
-            game_response = requests.get(
-                f"https://games.roblox.com/v1/games?universeIds={universe_id}",
-                timeout=10
-            )
+            game_url = f"https://games.roblox.com/v1/games?universeIds={universe_id}"
+            self.debug_log(f"Fetching game info for universe {universe_id}", "REQUEST")
+            self.debug_log(f"GET {game_url}", "REQUEST")
+            
+            start_time = time.time()
+            game_response = requests.get(game_url, timeout=10)
+            elapsed = time.time() - start_time
+            
+            self.debug_log(f"Game response: {game_response.status_code} in {elapsed:.3f}s", "RESPONSE")
             game_response.raise_for_status()
             game_data = game_response.json()
+            self.debug_log(f"Game data: {json.dumps(game_data, indent=2)}", "RESPONSE")
             game = game_data.get("data", [{}])[0]
             
             all_places = []
             cursor = None
+            page_count = 0
             
             while True:
+                page_count += 1
                 url = f"https://develop.roblox.com/v1/universes/{universe_id}/places?limit=100"
                 if cursor:
                     url += f"&cursor={cursor}"
-                    
+                
+                self.debug_log(f"Fetching places page {page_count}", "REQUEST")
+                self.debug_log(f"GET {url}", "REQUEST")
+                
+                start_time = time.time()
                 places_response = requests.get(url, timeout=10)
+                elapsed = time.time() - start_time
+                
+                self.debug_log(f"Places response: {places_response.status_code} in {elapsed:.3f}s", "RESPONSE")
                 places_response.raise_for_status()
                 places_data = places_response.json()
+                
+                places_count = len(places_data.get("data", []))
+                self.debug_log(f"Got {places_count} places on page {page_count}", "RESPONSE")
                 
                 all_places.extend(places_data.get("data", []))
                 cursor = places_data.get("nextPageCursor")
                 
                 if not cursor:
+                    self.debug_log(f"No more pages. Total places: {len(all_places)}", "INFO")
                     break
                     
             self.after(0, lambda: self.display_results(game, universe_id, all_places))
-            
-        except requests.exceptions.RequestException:
-            self.after(0, lambda: self.show_error("Network error: Check your connection"))
+        
+        except requests.exceptions.RequestException as e:
+            self.debug_log(f"Network error: {str(e)}", "ERROR")
+            self.after(0, lambda: self.show_error("Network error"))
         except Exception as e:
+            self.debug_log(f"General error: {str(e)}", "ERROR")
             self.after(0, lambda: self.show_error(f"Error: {str(e)}"))
         finally:
             self.after(0, self.hide_loading)
-            self.after(0, lambda: self.search_button.configure(state="normal", text="Search"))
-            
+            self.after(0, lambda: self.search_button.configure(state="normal", text="SEARCH"))
+                
     def display_results(self, game, universe_id, places):
         self.game_info_frame.grid(row=0, column=0, sticky="ew", pady=(0, 15))
         
         game_name = game.get("name", "Unknown Game")
-        self.game_name_label.configure(text=game_name)
+        self.game_name_label.configure(text=game_name.upper())
         
         creator = game.get("creator", {}).get("name", "Unknown")
         width = self.winfo_width()
         
         if width < 600:
-            stats_text = f"{len(places)} places • by {creator}"
+            stats_text = f"{len(places)} PLACES • {creator.upper()}"
         else:
-            stats_text = f"{len(places)} places • Universe {universe_id} • by {creator}"
+            stats_text = f"{len(places)} PLACES • UNIVERSE {universe_id} • {creator.upper()}"
         self.info_stats.configure(text=stats_text)
         
         self.root_place_id = game.get("rootPlaceId")
@@ -1071,9 +1876,9 @@ class RobloxSubplaceExplorer(ctk.CTk):
             
             self.place_cards.append((card, place, is_root))
                 
-        status_text = f"Found {len(places)} places"
+        status_text = f"FOUND {len(places)} PLACES"
         if not self.is_admin and any(not is_root for _, _, is_root in self.place_cards):
-            status_text += " (Admin rights required for subplaces)"
+            status_text += " - ADMIN REQUIRED"
             
         self.update_status(status_text)
         
@@ -1086,23 +1891,25 @@ class RobloxSubplaceExplorer(ctk.CTk):
         self.places_grid.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
         
     def show_error(self, message):
-        self.error_label.configure(text=f"⚠️ {message}")
-        self.update_status("Error")
+        self.error_label.configure(text=f"⚠ {message}")
+        self.update_status("ERROR")
         
         self.after(5000, lambda: self.error_label.configure(text=""))
         
     def update_status(self, message):
-        if not self.is_admin and "Ready" in message:
-            message += " (Limited Mode)"
-        self.status_label.configure(text=message)
+        if not self.is_admin and "READY" in message.upper():
+            message += " - LIMITED"
+        self.status_label.configure(text=message.upper())
         
     def open_place(self, place_id):
         webbrowser.open(f"https://www.roblox.com/games/{place_id}")
-        self.update_status(f"Opening place {place_id} in browser...")
+        self.update_status(f"OPENING {place_id}")
             
     def __del__(self):
         if hasattr(self, 'executor'):
             self.executor.shutdown(wait=False)
+        if hasattr(self, 'gamejoin_blocker'):
+            self.gamejoin_blocker.stop_blocking()
 
 if __name__ == "__main__":
     if sys.platform == "win32" and not is_admin():
