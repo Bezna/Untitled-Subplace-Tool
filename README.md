@@ -12,7 +12,7 @@ A tool to explore and join Roblox subplaces (hidden places) that are normally in
 ### Option 2: Run from Source
 1. **Install dependencies**
 ```bash
-pip install customtkinter requests Pillow 
+pip install customtkinter requests Pillow pydivert pywin32
 ```
 
 2. **Run**
