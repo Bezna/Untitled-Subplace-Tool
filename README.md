@@ -2,12 +2,6 @@
 
 A tool to explore and join Roblox subplaces (hidden places) that are normally inaccessible.
 
-## 🔒 Security
-- **100% Safe** - Your cookie is stored locally only
-- **No data collection** - We don't track or store anything
-- **Official APIs only** - Communicates only with Roblox servers
-- **Open source** - Review the code yourself
-
 ## 🚀 Quick Start
 
 ### Option 1: Download Ready-to-Use (Recommended)
@@ -18,7 +12,7 @@ A tool to explore and join Roblox subplaces (hidden places) that are normally in
 ### Option 2: Run from Source
 1. **Install dependencies**
 ```bash
-pip install customtkinter requests Pillow
+pip install customtkinter requests Pillow 
 ```
 
 2. **Run**
@@ -29,16 +23,11 @@ python main.py
 ## 📖 How to Use
 <img src="https://media1.giphy.com/media/v1.Y2lkPTc5MGI3NjExOXpkN3lucmRld3BoY3FyYWYydmNqZmQ5ZnZ5cmU5ZjA3ODNlMHU5bSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/WXjMhRqfkPyMbtbMup/giphy.gif" width="800">
 
-1. **Get your cookie**
-   - Open Roblox.com → F12 → Application → Cookies / Download EditThisCookie Extension
-   - Copy `.ROBLOSECURITY` value
-   - Paste in the app
-
-2. **Launch Roblox**
+1. **Launch Roblox**
    - Launch Roblox Player. 
    - It is very important!!!
    
-3. **Search & Join**
+2. **Search & Join**
    - Enter any Place ID
    - Click Search
    - Click Join on any place
